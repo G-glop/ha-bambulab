@@ -41,6 +41,7 @@ class WatchdogThread(threading.Thread):
         self._stop_event.set()
 
     def received_data(self):
+        LOGGER.debug(f"Watchdog fed after {time.time() - self._last_received_data} s")
         self._last_received_data = time.time()
 
     def run(self):
