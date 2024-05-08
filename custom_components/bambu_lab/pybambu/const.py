@@ -100,6 +100,14 @@ SPEED_PROFILE = {
     4: "ludicrous"
 }
 
+PRINT_TYPE_OPTIONS = {
+    "cloud",
+    "local",
+    "idle",
+    "system",
+    "unknown"
+}
+
 FILAMENT_NAMES = {
     "default": "Unknown",
     "GFB00": "Bambu ABS",
@@ -120,6 +128,7 @@ FILAMENT_NAMES = {
     "GFA05": "Bambu PLA Silk",
     "GFA08": "Bambu PLA Sparkle",
     "GFA09": "Bambu PLA Tough",
+    "GFA15": "Bambu PLA Galaxy",
     "GFA50": "Bambu PLA-CF",
     "GFS03": "Bambu Support For PA/PET",
     "GFS02": "Bambu Support For PLA",
