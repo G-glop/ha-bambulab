@@ -1,6 +1,6 @@
 import math
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from dateutil import parser, tz
 from packaging import version
@@ -11,6 +11,7 @@ from .utils import (
     fan_percentage_to_gcode,
     get_current_stage,
     get_filament_name,
+    get_ip_address_from_int,
     get_printer_type,
     get_speed_name,
     get_hw_version,
@@ -18,9 +19,10 @@ from .utils import (
     get_start_time,
     get_end_time,
     get_HMS_error_text,
-    get_generic_AMS_HMS_error_code,
+    get_print_error_text,
     get_HMS_severity,
     get_HMS_module,
+    set_temperature_to_gcode,
 )
 from .const import (
     LOGGER,
@@ -31,17 +33,20 @@ from .const import (
     SPEED_PROFILE,
     GCODE_STATE_OPTIONS,
     PRINT_TYPE_OPTIONS,
+    TempEnum,
 )
 from .commands import (
     CHAMBER_LIGHT_ON,
     CHAMBER_LIGHT_OFF,
+    PROMPT_SOUND_ENABLE,
+    PROMPT_SOUND_DISABLE,
     SPEED_PROFILE_TEMPLATE,
 )
 
 class Device:
     def __init__(self, client):
         self._client = client
-        self.temperature = Temperature()
+        self.temperature = Temperature(client = client)
         self.lights = Lights(client = client)
         self.info = Info(client = client)
         self.print_job = PrintJob(client = client)
@@ -51,7 +56,8 @@ class Device:
         self.ams = AMSList(client = client)
         self.external_spool = ExternalSpool(client = client)
         self.hms = HMSList(client = client)
-        self.camera = Camera()
+        self.print_error = PrintError(client = client)
+        self.camera = Camera(client = client)
         self.home_flag = HomeFlag(client=client)
         self.push_all_data = None
         self.get_version_data = None
@@ -71,12 +77,11 @@ class Device:
         send_event = send_event | self.ams.print_update(data = data)
         send_event = send_event | self.external_spool.print_update(data = data)
         send_event = send_event | self.hms.print_update(data = data)
+        send_event = send_event | self.print_error.print_update(data = data)
         send_event = send_event | self.camera.print_update(data = data)
         send_event = send_event | self.home_flag.print_update(data = data)
 
-        if send_event and self._client.callback is not None:
-            LOGGER.debug("event_printer_data_update")
-            self._client.callback("event_printer_data_update")
+        self._client.callback("event_printer_data_update")
 
         if data.get("msg", 0) == 0:
             self.push_all_data = data
@@ -88,9 +93,19 @@ class Device:
         if data.get("command") == "get_version":
             self.get_version_data = data
 
+    def _supports_temperature_set(self):
+        # When talking to the Bambu cloud mqtt, setting the temperatures is allowed.
+        if self.info.mqtt_mode == "bambu_cloud":
+            return True
+        # X1* have not yet blocked setting the temperatures when in nybrid connection mode.
+        if self.info.device_type == "X1" or self.info.device_type == "X1C" or self.info.device_type == "X1E":
+            return True
+        # What's left is P1 and A1 printers that we are connecting by local mqtt. These are supported only in pure Lan Mode.
+        return not self._client.bambu_cloud.bambu_connected
+
     def supports_feature(self, feature):
         if feature == Features.AUX_FAN:
-            return True
+            return self.info.device_type != "A1" and self.info.device_type != "A1MINI"
         elif feature == Features.CHAMBER_LIGHT:
             return True
         elif feature == Features.CHAMBER_FAN:
@@ -121,6 +136,13 @@ class Device:
             return self.info.device_type == "X1" or self.info.device_type == "X1C" or self.info.device_type == "X1E"
         elif feature == Features.MANUAL_MODE:
             return self.info.device_type == "P1P" or self.info.device_type == "P1S" or self.info.device_type == "A1" or self.info.device_type == "A1MINI"
+        elif feature == Features.AMS_FILAMENT_REMAINING:
+            # Technically this is not the AMS Lite but that's currently tied to only these printer types.
+            return self.info.device_type != "A1" and self.info.device_type != "A1MINI"
+        elif feature == Features.SET_TEMPERATURE:
+            return self._supports_temperature_set()
+        elif feature == Features.PROMPT_SOUND:
+            return self.info.device_type == "A1" or self.info.device_type == "A1MINI"
 
         return False
     
@@ -180,15 +202,13 @@ class Lights:
     def TurnChamberLightOn(self):
         self.chamber_light = "on"
         self.chamber_light_override = "on"
-        if self._client.callback is not None:
-            self._client.callback("event_light_update")
+        self._client.callback("event_light_update")
         self._client.publish(CHAMBER_LIGHT_ON)
 
     def TurnChamberLightOff(self):
         self.chamber_light = "off"
         self.chamber_light_override = "off"
-        if self._client.callback is not None:
-            self._client.callback("event_light_update")
+        self._client.callback("event_light_update")
         self._client.publish(CHAMBER_LIGHT_OFF)
 
 
@@ -200,7 +220,8 @@ class Camera:
     rtsp_url: str
     timelapse: str
 
-    def __init__(self):
+    def __init__(self, client):
+        self._client = client
         self.recording = ''
         self.resolution = ''
         self.rtsp_url = None
@@ -222,7 +243,10 @@ class Camera:
         self.timelapse = data.get("ipcam", {}).get("timelapse", self.timelapse)
         self.recording = data.get("ipcam", {}).get("ipcam_record", self.recording)
         self.resolution = data.get("ipcam", {}).get("resolution", self.resolution)
-        self.rtsp_url = data.get("ipcam", {}).get("rtsp_url", self.rtsp_url)
+        if self._client._enable_camera:
+            self.rtsp_url = data.get("ipcam", {}).get("rtsp_url", self.rtsp_url)
+        else:
+            self.rtsp_url = None
         
         return (old_data != f"{self.__dict__}")
 
@@ -235,7 +259,8 @@ class Temperature:
     nozzle_temp: int
     target_nozzle_temp: int
 
-    def __init__(self):
+    def __init__(self, client):
+        self._client = client
         self.bed_temp = 0
         self.target_bed_temp = 0
         self.chamber_temp = 0
@@ -252,6 +277,20 @@ class Temperature:
         self.target_nozzle_temp = round(data.get("nozzle_target_temper", self.target_nozzle_temp))
         
         return (old_data != f"{self.__dict__}")
+
+    def set_target_temp(self, temp: TempEnum, temperature: int):
+        command = set_temperature_to_gcode(temp, temperature)
+
+        # if type == TempEnum.HEATBED:
+        #     self.bed_temp = temperature
+        # elif type == TempEnum.NOZZLE:
+        #     self.nozzle_temp = temperature
+
+        LOGGER.debug(command)
+        self._client.publish(command)
+
+        self._client.callback("event_printer_data_update")
+
 
 @dataclass
 class Fans:
@@ -332,8 +371,7 @@ class Fans:
         LOGGER.debug(command)
         self._client.publish(command)
 
-        if self._client.callback is not None:
-            self._client.callback("event_printer_data_update")
+        self._client.callback("event_printer_data_update")
 
     def get_fan_speed(self, fan: FansEnum) -> int:
         if fan == FansEnum.PART_COOLING:
@@ -381,7 +419,7 @@ class PrintJob:
         values = {}
         for i in range(16):
             if self._ams_print_weights[i] != 0:
-                values[f"AMS Slot {i}"] = self._ams_print_weights[i]
+                values[f"AMS Slot {i+1}"] = self._ams_print_weights[i]
         return values
 
     @property
@@ -389,7 +427,7 @@ class PrintJob:
         values = {}
         for i in range(16):
             if self._ams_print_lengths[i] != 0:
-                values[f"AMS Slot {i}"] = self._ams_print_lengths[i]
+                values[f"AMS Slot {i+1}"] = self._ams_print_lengths[i]
         return values
 
     def __init__(self, client):
@@ -437,17 +475,16 @@ class PrintJob:
         self.print_percentage = data.get("mc_percent", self.print_percentage)
         previous_gcode_state = self.gcode_state
         self.gcode_state = data.get("gcode_state", self.gcode_state)
-        if previous_gcode_state != self.gcode_state:
-            LOGGER.debug(f"GCODE_STATE: {previous_gcode_state} -> {self.gcode_state}")
         if self.gcode_state.lower() not in GCODE_STATE_OPTIONS:
-            LOGGER.debug(f"Unknown gcode_state. Please log an issue : '{self.gcode_state}'")
+            LOGGER.error(f"Unknown gcode_state. Please log an issue : '{self.gcode_state}'")
             self.gcode_state = "unknown"
         if previous_gcode_state != self.gcode_state:
             LOGGER.debug(f"GCODE_STATE: {previous_gcode_state} -> {self.gcode_state}")
         self.gcode_file = data.get("gcode_file", self.gcode_file)
         self.print_type = data.get("print_type", self.print_type)
         if self.print_type.lower() not in PRINT_TYPE_OPTIONS:
-            LOGGER.debug(f"Unknown print_type. Please log an issue : '{self.print_type}'")
+            if self.print_type != "":
+                LOGGER.debug(f"Unknown print_type. Please log an issue : '{self.print_type}'")
             self.print_type = "unknown"
         self.subtask_name = data.get("subtask_name", self.subtask_name)
         self.file_type_icon = "mdi:file" if self.print_type != "cloud" else "mdi:cloud-outline"
@@ -468,19 +505,18 @@ class PrintJob:
         if data.get("mc_remaining_time") is not None:
             existing_remaining_time = self.remaining_time
             self.remaining_time = data.get("mc_remaining_time")
-            if self.start_time is None:
-                self.end_time = None
-            elif existing_remaining_time != self.remaining_time:
-                self.end_time = get_end_time(self.remaining_time)
-                LOGGER.debug(f"END TIME2: {self.end_time}")
+            if existing_remaining_time != self.remaining_time:
+                end_time = get_end_time(self.remaining_time)
+                if end_time != self.end_time:
+                    self.end_time = end_time
+                    LOGGER.debug(f"END TIME2: {self.end_time}")
 
         # Handle print start
         previously_idle = previous_gcode_state == "IDLE" or previous_gcode_state == "FAILED" or previous_gcode_state == "FINISH"
         currently_idle = self.gcode_state == "IDLE" or self.gcode_state == "FAILED" or self.gcode_state == "FINISH"
 
         if previously_idle and not currently_idle:
-            if self._client.callback is not None:
-               self._client.callback("event_print_started")
+            self._client.callback("event_print_started")
 
             # Generate the start_time for P1P/S when printer moves from idle to another state. Original attempt with remaining time
             # becoming non-zero didn't work as it never bounced to zero in at least the scenario where a print was canceled.
@@ -504,20 +540,17 @@ class PrintJob:
         isCanceledPrint = False
         if data.get("print_error") == 50348044 and self.print_error == 0:
             isCanceledPrint = True
-            if self._client.callback is not None:
-               self._client.callback("event_print_canceled")
+            self._client.callback("event_print_canceled")
         self.print_error = data.get("print_error", self.print_error)
 
         # Handle print failed
         if previous_gcode_state != "unknown" and previous_gcode_state != "FAILED" and self.gcode_state == "FAILED":
             if not isCanceledPrint:
-                if self._client.callback is not None:
-                   self._client.callback("event_print_failed")
+                self._client.callback("event_print_failed")
 
         # Handle print finish
         if previous_gcode_state != "unknown" and previous_gcode_state != "FINISH" and self.gcode_state == "FINISH":
-            if self._client.callback is not None:
-               self._client.callback("event_print_finished")
+            self._client.callback("event_print_finished")
 
         if currently_idle and not previously_idle and previous_gcode_state != "unknown":
             if self.start_time != None:
@@ -612,8 +645,8 @@ class PrintJob:
                 if self._client._device.supports_feature(Features.START_TIME_GENERATED) and (status == 4):
                     # If we generate the start time (not X1), then rely more heavily on the cloud task data and
                     # do so uniformly so we always have matched start/end times.
-
                     # "startTime": "2023-12-21T19:02:16Z"
+                    
                     cloud_time_str = self._task_data.get('startTime', "")
                     LOGGER.debug(f"CLOUD START TIME1: {self.start_time}")
                     if cloud_time_str != "":
@@ -633,7 +666,6 @@ class PrintJob:
                         self.end_time = local_dt
                         LOGGER.debug(f"CLOUD END TIME2: {self.end_time}")
 
-
 @dataclass
 class Info:
     """Return all device related content"""
@@ -651,12 +683,13 @@ class Info:
     nozzle_diameter: float
     nozzle_type: str
     usage_hours: float
+    _ip_address: str
 
     def __init__(self, client):
         self._client = client
 
         self.serial = self._client._serial
-        self.device_type = self._client._device_type.upper()
+        self.device_type = self._client._device_type
         self.wifi_signal = 0
         self.hw_ver = "unknown"
         self.sw_ver = "unknown"
@@ -666,12 +699,12 @@ class Info:
         self.nozzle_diameter = 0
         self.nozzle_type = "unknown"
         self.usage_hours = client._usage_hours
+        self._ip_address = ""
 
     def set_online(self, online):
         if self.online != online:
             self.online = online
-            if self._client.callback is not None:
-                self._client.callback("event_printer_data_update")
+            self._client.callback("event_printer_data_update")
 
     def info_update(self, data):
 
@@ -700,8 +733,7 @@ class Info:
         LOGGER.debug(f"Device is {self.device_type}")
         self.hw_ver = get_hw_version(modules, self.hw_ver)
         self.sw_ver = get_sw_version(modules, self.sw_ver)
-        if self._client.callback is not None:
-            self._client.callback("event_printer_info_update")
+        self._client.callback("event_printer_info_update")
 
     def print_update(self, data) -> bool:
         old_data = f"{self.__dict__}"
@@ -726,6 +758,28 @@ class Info:
         #         "total_layer_num": 0,
 
         self.wifi_signal = int(data.get("wifi_signal", str(self.wifi_signal)).replace("dBm", ""))
+
+        # "print": {
+        #   "net": {
+        #     "conf": 16,
+        #     "info": [
+        #       {
+        #         "ip": 1594493450,
+        #         "mask": 16777215
+        #       },
+        #       {
+        #         "ip": 0,
+        #         "mask": 0
+        #       }
+        #     ]
+        #   },
+
+        info = data.get('net', {}).get('info', [])
+        for net in info:
+            ip_int = net.get("ip", 0)
+            if net.get("ip", 0) != 0:
+                self._ip_address = get_ip_address_from_int(ip_int)
+                break
 
         # Version data is provided differently for X1 and P1
         # P1P example:
@@ -784,37 +838,59 @@ class Info:
         self.nozzle_diameter = float(data.get("nozzle_diameter", self.nozzle_diameter))
         self.nozzle_type = data.get("nozzle_type", self.nozzle_type)
 
+        #
+
         return (old_data != f"{self.__dict__}")
 
     @property
     def has_bambu_cloud_connection(self) -> bool:
         return self._client.bambu_cloud.auth_token != ""
+    
+    @property
+    def ip_address(self) -> str:
+        return self._ip_address
+    
+    def set_prompt_sound(self, enable: bool):
+        if enable:
+            self._client.publish(PROMPT_SOUND_ENABLE)
+        else:
+            self._client.publish(PROMPT_SOUND_DISABLE)
+       
 
 @dataclass
 class AMSInstance:
     """Return all AMS instance related info"""
+    serial: str
+    sw_version: str
+    hw_version: str
+    humidity_index: int
+    temperature: int
+    tray: list["AMSTray"]
 
-    def __init__(self):
+    def __init__(self, client):
         self.serial = ""
         self.sw_version = ""
         self.hw_version = ""
         self.humidity_index = 0
         self.temperature = 0
         self.tray = [None] * 4
-        self.tray[0] = AMSTray()
-        self.tray[1] = AMSTray()
-        self.tray[2] = AMSTray()
-        self.tray[3] = AMSTray()
+        self.tray[0] = AMSTray(client)
+        self.tray[1] = AMSTray(client)
+        self.tray[2] = AMSTray(client)
+        self.tray[3] = AMSTray(client)
 
 
 @dataclass
 class AMSList:
     """Return all AMS related info"""
+    tray_now: int
+    data: list[AMSInstance]
 
     def __init__(self, client):
         self._client = client
         self.tray_now = 0
         self.data = [None] * 4
+        self._first_initialization_done = False
 
     def info_update(self, data):
         old_data = f"{self.__dict__}"
@@ -856,11 +932,11 @@ class AMSList:
             
             if index != -1:
                 # Sometimes we get incomplete version data. We have to skip if that occurs since the serial number is
-                # requires as part of the home assistant device identity.
+                # required as part of the home assistant device identity.
                 if not module['sn'] == '':
                     # May get data before info so create entries if necessary
                     if self.data[index] is None:
-                        self.data[index] = AMSInstance()
+                        self.data[index] = AMSInstance(self._client)
 
                     if self.data[index].serial != module['sn']:
                         data_changed = True
@@ -871,12 +947,14 @@ class AMSList:
                     if self.data[index].hw_version != module['hw_ver']:
                         data_changed = True
                         self.data[index].hw_version = module['hw_ver']
+            elif not self._first_initialization_done:
+                self._first_initialization_done = True
+                data_changed = True
 
         data_changed = data_changed or (old_data != f"{self.__dict__}")
 
         if data_changed:
-            if self._client.callback is not None:
-                self._client.callback("event_ams_info_update")
+            self._client.callback("event_ams_info_update")
 
     def print_update(self, data) -> bool:
         old_data = f"{self.__dict__}"
@@ -948,7 +1026,7 @@ class AMSList:
                 index = int(ams['id'])
                 # May get data before info so create entry if necessary
                 if self.data[index] is None:
-                    self.data[index] = AMSInstance()
+                    self.data[index] = AMSInstance(self._client)
 
                 if self.data[index].humidity_index != int(ams['humidity']):
                     self.data[index].humidity_index = int(ams['humidity'])
@@ -966,8 +1044,22 @@ class AMSList:
 @dataclass
 class AMSTray:
     """Return all AMS tray related info"""
+    empty: bool
+    idx: int
+    name: str
+    type: str
+    sub_brands: str
+    color: str
+    nozzle_temp_min: int
+    nozzle_temp_max: int
+    remain: int
+    k: float
+    tag_uid: str
+    tray_uuid: str
 
-    def __init__(self):
+
+    def __init__(self, client):
+        self._client = client
         self.empty = True
         self.idx = ""
         self.name = ""
@@ -978,7 +1070,8 @@ class AMSTray:
         self.nozzle_temp_max = 0
         self.remain = 0
         self.k = 0
-        self.tag_uid = "0000000000000000"
+        self.tag_uid = ""
+        self.tray_uuid = ""
 
     def print_update(self, data) -> bool:
         old_data = f"{self.__dict__}"
@@ -994,12 +1087,13 @@ class AMSTray:
             self.nozzle_temp_min = 0
             self.nozzle_temp_max = 0
             self.remain = 0
-            self.tag_uid = "0000000000000000"
+            self.tag_uid = ""
+            self.tray_uuid = ""
             self.k = 0
         else:
             self.empty = False
             self.idx = data.get('tray_info_idx', self.idx)
-            self.name = get_filament_name(self.idx)
+            self.name = get_filament_name(self.idx, self._client.slicer_settings.custom_filaments)
             self.type = data.get('tray_type', self.type)
             self.sub_brands = data.get('tray_sub_brands', self.sub_brands)
             self.color = data.get('tray_color', self.color)
@@ -1007,6 +1101,7 @@ class AMSTray:
             self.nozzle_temp_max = data.get('nozzle_temp_max', self.nozzle_temp_max)
             self.remain = data.get('remain', self.remain)
             self.tag_uid = data.get('tag_uid', self.tag_uid)
+            self.tray_uuid = data.get('tray_uuid', self.tray_uuid)
             self.k = data.get('k', self.k)
         
         return (old_data != f"{self.__dict__}")
@@ -1017,7 +1112,7 @@ class ExternalSpool(AMSTray):
     """Return the virtual tray related info"""
 
     def __init__(self, client):
-        super().__init__()
+        super().__init__(client)
         self._client = client
 
     def print_update(self, data) -> bool:
@@ -1088,8 +1183,7 @@ class Speed:
                 command = SPEED_PROFILE_TEMPLATE
                 command['print']['param'] = f"{id}"
                 self._client.publish(command)
-                if self._client.callback is not None:
-                    self._client.callback("event_speed_update")
+                self._client.callback("event_speed_update")
 
 
 @dataclass
@@ -1153,8 +1247,9 @@ class HMSList:
                 index = index + 1
                 attr = int(hms['attr'])
                 code = int(hms['code'])
-                hms_notif = HMSNotification(attr=attr, code=code)
-                errors[f"{index}-Error"] = f"HMS_{hms_notif.hms_code}: {get_HMS_error_text(hms_notif.hms_code)}"
+                hms_notif = HMSNotification(user_language=self._client.user_language, attr=attr, code=code)
+                errors[f"{index}-Code"] = f"HMS_{hms_notif.hms_code}"
+                errors[f"{index}-Error"] = hms_notif.hms_error
                 errors[f"{index}-Wiki"] = hms_notif.wiki_url
                 errors[f"{index}-Severity"] = hms_notif.severity
                 #LOGGER.debug(f"HMS error for '{hms_notif.module}' and severity '{hms_notif.severity}': HMS_{hms_notif.hms_code}")
@@ -1165,8 +1260,7 @@ class HMSList:
                 self._errors = errors
                 if self._count != 0:
                     LOGGER.warning(f"HMS ERRORS: {errors}")
-                if self._client.callback is not None:
-                    self._client.callback("event_hms_errors")
+                self._client.callback("event_printer_error")
                 return True
         
         return False
@@ -1180,12 +1274,58 @@ class HMSList:
     def error_count(self) -> int:
         return self._count
 
+@dataclass
+class PrintError:
+    """Return all print_error related info"""
+    _error: dict
+
+    def __init__(self, client):
+        self._error = None
+        self._client = client
+        
+    def print_update(self, data) -> bool:
+        # Example payload:
+        # "print_error": 117473286 
+        # So this is 07008006 which we make more human readable to 0700-8006
+        # https://e.bambulab.com/query.php?lang=en
+        # 'Unable to feed filament into the extruder. This could be due to entangled filament or a stuck spool. If not, please check if the AMS PTFE tube is connected.'
+
+        if 'print_error' in data.keys():
+            errors = None
+            code = data.get('print_error')
+            if code != 0:
+                code = f'0{int(code):x}'
+                code = code[slice(0,4,1)] + "_" + code[slice(4,8,1)]
+                code = code.upper()
+                errors = {}
+                errors[f"code"] = code
+                errors[f"error"] = get_print_error_text(code, self._client.user_language)
+                # LOGGER.warning(f"PRINT ERRORS: {errors}") # This will emit a message to home assistant log every 1 second if enabled
+
+            if self._error != errors:
+                self._error = errors
+                self._client.callback("event_print_error")
+
+        # We send the error event directly so always return False for the general data event.
+        return False
+    
+    @property
+    def error(self) -> dict:
+        return self._error
+    
+    @property
+    def on(self) -> int:
+        return self._error is not None
+
 
 @dataclass
 class HMSNotification:
     """Return an HMS object and all associated details"""
+    attr: int
+    code: int
 
-    def __init__(self, attr: int = 0, code: int = 0):
+    def __init__(self, user_language: str, attr: int, code: int):
+        self._user_language = user_language
         self.attr = attr
         self.code = code
 
@@ -1202,11 +1342,17 @@ class HMSNotification:
         if self.attr > 0 and self.code > 0:
             return f'{int(self.attr / 0x10000):0>4X}_{self.attr & 0xFFFF:0>4X}_{int(self.code / 0x10000):0>4X}_{self.code & 0xFFFF:0>4X}' # 0300_0100_0001_0007
         return ""
+    
+    @property
+    def hms_error(self) -> str:
+        error_text = get_HMS_error_text(code=self.hms_code, language=self._user_language)
+        return error_text
 
     @property
     def wiki_url(self):
         if self.attr > 0 and self.code > 0:
-            return f"https://wiki.bambulab.com/en/x1/troubleshooting/hmscode/{get_generic_AMS_HMS_error_code(self.hms_code)}"
+            # Only English wiki content seems to exist
+            return f"https://wiki.bambulab.com/en/x1/troubleshooting/hmscode/{self.hms_code}"
         return ""
 
 
@@ -1219,21 +1365,19 @@ class ChamberImage:
         self._image_last_updated = datetime.now()
 
     def set_jpeg(self, bytes):
-        #LOGGER.debug("JPEG RECEIVED")
         self._bytes = bytes
         self._image_last_updated = datetime.now()
-        if self._client.callback is not None:
-            self._client.callback("event_printer_chamber_image_update")
-        #LOGGER.debug("JPEG RECIEVED DONE")
-    
+        self._client.callback("event_printer_chamber_image_update")
+
     def get_jpeg(self) -> bytearray:
-        #LOGGER.debug("JPEG RETRIEVED")
-        value = self._bytes.copy()
-        #LOGGER.debug("JPEG RETRIEVED DONE")
-        return value
+        return self._bytes.copy()
     
     def get_last_update_time(self) -> datetime:
         return self._image_last_updated
+    
+    @property
+    def available(self):
+        return self._client._enable_camera 
     
 @dataclass
 class CoverImage:
@@ -1243,8 +1387,7 @@ class CoverImage:
         self._client = client
         self._bytes = bytearray()
         self._image_last_updated = datetime.now()
-        if self._client.callback is not None:
-            self._client.callback("event_printer_cover_image_update")
+        self._client.callback("event_printer_cover_image_update")
 
     def set_jpeg(self, bytes):
         self._bytes = bytes
@@ -1360,3 +1503,29 @@ class HomeFlag:
     @property
     def p1s_upgrade_installed(self) -> bool:
         return (self._value & Home_Flag_Values.INSTALLED_PLUS) !=  0
+
+
+class SlicerSettings:
+    custom_filaments: dict = field(default_factory=dict)
+
+    def __init__(self, client):
+        self._client = client
+        self.custom_filaments = {}
+
+    def _load_custom_filaments(self, slicer_settings: dict):
+        if 'private' in slicer_settings["filament"]:
+            for filament in slicer_settings['filament']['private']:
+                name = filament["name"]
+                if " @" in name:
+                    name = name[:name.index(" @")]
+                if filament.get("filament_id", "") != "":
+                    self.custom_filaments[filament["filament_id"]] = name
+            LOGGER.debug("Got custom filaments: %s", self.custom_filaments)
+
+    def update(self):
+        self.custom_filaments = {}
+        if self._client.bambu_cloud.auth_token != "":
+            LOGGER.debug("Loading slicer settings")
+            slicer_settings = self._client.bambu_cloud.get_slicer_settings()
+            if slicer_settings is not None:
+                self._load_custom_filaments(slicer_settings)
